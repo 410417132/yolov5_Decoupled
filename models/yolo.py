@@ -1,4 +1,4 @@
-# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
 """
 YOLO-specific modules
 
@@ -21,8 +21,8 @@ if str(ROOT) not in sys.path:
 if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.common import *  # noqa
-from models.experimental import *  # noqa
+from models.common import *
+from models.experimental import *
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
@@ -76,7 +76,7 @@ class Detect(nn.Module):
                     y = torch.cat((xy, wh, conf), 4)
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
-        return x if self.training else (torch.cat(z, 1), ) if self.export else (torch.cat(z, 1), x)
+        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
 
     def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, '1.10.0')):
         d = self.anchors[i].device
@@ -107,6 +107,18 @@ class Segment(Detect):
 
 
 class BaseModel(nn.Module):
+#2023/12/13 add
+    def _apply(self, fn):
+        # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
+        self = super()._apply(fn)
+        m = self.model[-1]  # Detect()
+        if isinstance(m, (Detect, Segment,Decoupled_Detect)):
+            m.stride = fn(m.stride)
+            m.grid = list(map(fn, m.grid))
+            if isinstance(m.anchor_grid, list):
+                m.anchor_grid = list(map(fn, m.anchor_grid))
+        return self
+#2023.12.13 end
     # YOLOv5 base model
     def forward(self, x, profile=False, visualize=False):
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
@@ -126,7 +138,7 @@ class BaseModel(nn.Module):
 
     def _profile_one_layer(self, m, x, dt):
         c = m == self.model[-1]  # is final layer, copy input as inplace fix
-        o = thop.profile(m, inputs=(x.copy() if c else x, ), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
+        o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
         t = time_sync()
         for _ in range(10):
             m(x.copy() if c else x)
@@ -163,6 +175,45 @@ class BaseModel(nn.Module):
 
 
 class DetectionModel(BaseModel):
+    #2023/12/13 add
+    def _initialize_dh_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+        # https://arxiv.org/abs/1708.02002 section 3.3
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
+        m = self.model[-1]  # Detect() module
+        for mi, s in zip(m.m, m.stride):  # from
+            # reg_bias = mi.reg_preds.bias.view(m.na, -1).detach()
+            # reg_bias += math.log(8 / (640 / s) ** 2)
+            # mi.reg_preds.bias = torch.nn.Parameter(reg_bias.view(-1), requires_grad=True)
+ 
+            # cls_bias = mi.cls_preds.bias.view(m.na, -1).detach()
+            # cls_bias += math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # cls
+            # mi.cls_preds.bias = torch.nn.Parameter(cls_bias.view(-1), requires_grad=True)
+            b = mi.b3.bias.view(m.na, -1)
+            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+            mi.b3.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+            b = mi.c3.bias.data
+            b += math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # cls
+            mi.c3.bias = torch.nn.Parameter(b, requires_grad=True)
+
+
+        if isinstance(m, (Detect, Segment,ASFF_Detect)):
+                s = 256  # 2x min stride
+                m.inplace = self.inplace
+                forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
+                m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+                check_anchor_order(m)
+                m.anchors /= m.stride.view(-1, 1, 1)
+                self.stride = m.stride
+                self._initialize_biases()  # only run once
+        elif isinstance(m, Decoupled_Detect):
+                s = 256  # 2x min stride
+                m.inplace = self.inplace
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+                check_anchor_order(m)  # must be in pixel-space (not grid-space)
+                m.anchors /= m.stride.view(-1, 1, 1)
+                self.stride = m.stride
+                self._initialize_dh_biases()  # only run once
+    #2023/12/13 end
     # YOLOv5 detection model
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super().__init__()
@@ -340,6 +391,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
+#2023/12/13 add
+        elif m in {Detect, Segment,Decoupled_Detect}:
+            args.append([ch[x] for x in f])
+            if isinstance(args[1], int):  # number of anchors
+                args[1] = [list(range(args[1] * 2))] * len(f)
+            if m is Segment:
+                args[3] = make_divisible(args[3] * gw, 8)
+#2023/12/13 end
         else:
             c2 = ch[f]
 

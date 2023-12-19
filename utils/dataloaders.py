@@ -803,7 +803,11 @@ class LoadImagesAndLabels(Dataset):
                                            shear=self.hyp['shear'],
                                            perspective=self.hyp['perspective'],
                                            border=self.mosaic_border)  # border to remove
-
+        # Save the augmented image
+        save_dir = '/content/augmented/images'
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'augmented_{index}.jpg')
+        cv2.imwrite(save_path, img4)
         return img4, labels4
 
     def load_mosaic9(self, index):
